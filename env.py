@@ -137,10 +137,16 @@ class GridEnv(gym.Env):
 # ------------------------------------------------------------
 
 # 원본 맵 생성 (goal과 reachable start 리스트 포함)
-grid, goal, _ = generate_diverse_path(height=15, width=15, wall_prob=0.2)
+
+height=15
+width=15
+wall_prob = 0.7
+grid, goal, _ = generate_diverse_path(height, width, wall_prob)
 
 # 변형 적용
-mutated_grid = mutate_walls_nearby(grid, mutation_rate=0.2, patch_size=3)
+mutation_rate = 0.5
+patch_size = 3
+mutated_grid = mutate_walls_nearby(grid, mutation_rate, patch_size)
 
 # 변형된 맵에서 reachable 위치 다시 계산
 reachable_starts = []
@@ -154,8 +160,7 @@ if len(reachable_starts) == 0:
     print("❌ 변형된 맵에서는 goal에 도달할 수 있는 위치가 없음. 다시 생성 중...")
     # 재귀적으로 다시 시도
     while True:
-        grid, goal, _ = generate_diverse_path(height=15, width=15, wall_prob=0.2)
-        mutated_grid = mutate_walls_nearby(grid, mutation_rate=0.2, patch_size=3)
+        mutated_grid = mutate_walls_nearby(grid, mutation_rate, patch_size)
         reachable_starts = []
         for y in range(mutated_grid.shape[0]):
             for x in range(mutated_grid.shape[1]):
