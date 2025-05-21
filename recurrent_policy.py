@@ -6,18 +6,24 @@ import torch
 
 class CustomFeatureExtractor(BaseFeaturesExtractor):
     
-    def __init__(self, observation_space: gym.spaces.Box):
-        super().__init__(observation_space, features_dim=64)
-        input_dim = observation_space.shape[0]
-        self.fc = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-        )
+    def __init__(self, observation_space,features_dim=1):
+        super().__init__(observation_space, features_dim)
+        input_dim = observation_space.shape[0]*observation_space.shape[1]
+        
+        self.conv = nn.Conv2d(input_dim, 32, kernel_size=2, stride=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.flt = nn.Flatten()
+        self.fc1 = nn.Linear(32*2*2, features_dim) #Assuming 3 by 3 conv input
+
+        self.act = nn.ReLU()
+
+        self._features_dim = features_dim
 
     def forward(self, obs):
-        return self.fc(obs)
+        out = self.conv(obs)
+        out = self.act(self.bn1(out))
+        out = self.fc1(self.flt(out))
+        return out
 
 class CustomLSTMPolicy(ActorCriticLstmPolicy):
     
