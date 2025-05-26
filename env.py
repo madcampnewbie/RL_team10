@@ -1,7 +1,8 @@
 import numpy as np
 import random
-import gym
-from gym import spaces
+import gymnasium as gym                  
+from gymnasium import spaces             
+from gymnasium.spaces import Dict        
 from collections import deque
 
 # ------------------------------------------------------------
@@ -80,54 +81,88 @@ def mutate_walls_nearby(grid, mutation_rate=0.2, patch_size=3):
 # 강화학습 환경 클래스
 # ------------------------------------------------------------
 class GridEnv(gym.Env):
-    def __init__(self, grid, goal, reachable_starts):
+    def __init__(self, grid, goal, reachable_starts, original, render_mode=None):
         super(GridEnv, self).__init__()
         self.grid = grid
         self.goal = goal
+        self.original = original
+        self.render_mode = render_mode
+
+        self.memory_map = np.full_like(grid, -1, dtype=np.int32)
+        self.act_map = np.full((grid.shape[0], grid.shape[1], 4), -1, dtype=np.int32)  # ← 초기값 -1로 변경
         self.reachable_starts = reachable_starts
         self.height, self.width = grid.shape
 
-        self.action_space = spaces.Discrete(4)  # 상하좌우
-        self.observation_space = spaces.Box(low=0, high=2, shape=(3, 3), dtype=np.int32) # 관찰 가능한 공간 (3x3)
+        self.action_space = gym.spaces.Discrete(4)
+        self.observation_space = gym.spaces.Dict({
+            "local":    gym.spaces.Box(0, 2, (3, 3), dtype=np.int32),
+            "original": gym.spaces.Box(0, 2, self.grid.shape, dtype=np.int32),
+            "memory":   gym.spaces.Box(-1, 3, self.grid.shape, dtype=np.int32),
+            "act_mem":  gym.spaces.Box(-1, np.iinfo(np.int32).max, (self.height, self.width, 4), dtype=np.int32),
+        })
 
-    def reset(self):
-        # reachable 한 빈 칸 중 하나에서 agent 배치
-        self.agent_pos = list(random.choice(self.reachable_starts))
-        self.steps = 0
-        return self._get_obs()
-
-    def _get_obs(self):
+    def _update_memory(self):
         y, x = self.agent_pos
-        obs = np.ones((3, 3), dtype=np.int32)  # 벽으로 초기화
         for dy in range(-1, 2):
             for dx in range(-1, 2):
                 ny, nx = y + dy, x + dx
                 if 0 <= ny < self.height and 0 <= nx < self.width:
-                    obs[dy + 1, dx + 1] = self.grid[ny, nx]
-        return obs
+                    self.memory_map[ny, nx] = self.grid[ny, nx]
+
+    def reset(self, *, seed=None, options=None):
+        self.agent_pos = list(random.choice(self.reachable_starts))
+        self.steps = 0
+        self.memory_map.fill(-1)
+        self.act_map.fill(-1)  # 초기화 시 -1로 설정
+        self._update_memory()
+        return self._get_obs(), {}
+
+    def _get_obs(self):
+        y, x = self.agent_pos
+        local = np.ones((3, 3), dtype=np.int32)
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < self.height and 0 <= nx < self.width:
+                    local[dy + 1, dx + 1] = self.grid[ny, nx]
+        return {
+            "local": local,
+            "original": self.original,
+            "memory": self.memory_map.copy(),
+            "act_mem": self.act_map.copy(),
+        }
 
     def step(self, action):
         y, x = self.agent_pos
-        dy, dx = [( -1, 0), (1, 0), (0, -1), (0, 1)][action]
+        dy, dx = [(-1, 0), (1, 0), (0, -1), (0, 1)][action]
         ny, nx = y + dy, x + dx
 
+        moved = False
         if 0 <= ny < self.height and 0 <= nx < self.width and self.grid[ny, nx] != 1:
             self.agent_pos = [ny, nx]
+            moved = True
 
+        self._update_memory()
         self.steps += 1
-        done = self.agent_pos == list(self.goal)
-        reward = 1 if done else 0
-        return self._get_obs(), reward, done, {}
+        self.act_map[y, x, action] = self.steps  # 현재 스텝 시점 기록
 
-    def render(self, mode='human'):
-        view = np.array(self.grid, dtype=str)
-        view[view == '0'] = '.'
-        view[view == '1'] = '#'
-        view[view == '2'] = 'G'
-        y, x = self.agent_pos
-        view[y, x] = 'A'
-        print('\n'.join(''.join(row) for row in view))
-        print()
+        terminated = self.agent_pos == list(self.goal)
+        step_penalty = -0.01
+        stay_penalty = -0.1 if not moved else 0.0
+        reward = (10.0 if terminated else 0.0) + step_penalty + stay_penalty
+
+        return self._get_obs(), reward, terminated, False, {}
+
+    def render(self):
+        if self.render_mode == 'human':
+            view = np.array(self.grid, dtype=str)
+            view[view == '0'] = '.'
+            view[view == '1'] = '#'
+            view[view == '2'] = 'G'
+            y, x = self.agent_pos
+            view[y, x] = 'A'
+            print("\n".join("".join(row) for row in view))
+            print()
 
     def close(self):
         pass
@@ -136,53 +171,27 @@ class GridEnv(gym.Env):
 # 사용 예시
 # ------------------------------------------------------------
 
-# 원본 맵 생성 (goal과 reachable start 리스트 포함)
+# # 1) 맵 준비 ---------------------------------------------------
+# height, width, wall_prob = 15, 15, 0.7
+# grid, goal, _ = generate_diverse_path(height, width, wall_prob)
+# original = grid.copy()
+# mutated  = mutate_walls_nearby(grid, 0.5, 3)
 
-height=15
-width=15
-wall_prob = 0.7
-grid, goal, _ = generate_diverse_path(height, width, wall_prob)
+# reachable = [(y,x) for y in range(height) for x in range(width)
+#              if mutated[y,x]==0 and is_path_exists(mutated,(y,x),goal)]
+# env = GridEnv(mutated, goal, reachable, original)
 
-# 변형 적용
-mutation_rate = 0.5
-patch_size = 3
-mutated_grid = mutate_walls_nearby(grid, mutation_rate, patch_size)
+# # 2) 랜덤 워크 --------------------------------------------------
+# obs, _ = env.reset()
+# max_step = 500          # 무한 루프 방지용 한도
+# for step in range(1, max_step+1):
+#     env.render()                     # 맵 출력
+#     action = env.action_space.sample()
+#     obs, _, terminated, truncated, _ = env.step(action)
 
-# 변형된 맵에서 reachable 위치 다시 계산
-reachable_starts = []
-for y in range(mutated_grid.shape[0]):
-    for x in range(mutated_grid.shape[1]):
-        if mutated_grid[y, x] == 0 and is_path_exists(mutated_grid, (y, x), goal):
-            reachable_starts.append((y, x))
-
-# reachable 위치가 존재하지 않으면 다시 생성
-if len(reachable_starts) == 0:
-    print("❌ 변형된 맵에서는 goal에 도달할 수 있는 위치가 없음. 다시 생성 중...")
-    # 재귀적으로 다시 시도
-    while True:
-        mutated_grid = mutate_walls_nearby(grid, mutation_rate, patch_size)
-        reachable_starts = []
-        for y in range(mutated_grid.shape[0]):
-            for x in range(mutated_grid.shape[1]):
-                if mutated_grid[y, x] == 0 and is_path_exists(mutated_grid, (y, x), goal):
-                    reachable_starts.append((y, x))
-        if len(reachable_starts) > 0:
-            break
-
-# 환경 생성 (변형된 맵 + 기존 goal 위치 + reachable 시작점)
-env = GridEnv(mutated_grid, goal, reachable_starts)
-
-# 환경 초기화
-obs = env.reset()
-done = False
-
-# 랜덤한 정책으로 실행
-while not done:
-    env.render()
-    action = env.action_space.sample()  # 무작위 행동
-    obs, reward, done, _ = env.step(action)
-
-if reward == 1:
-    print("🎉 Goal reached!")
-else:
-    print("❌ Failed to reach the goal.")
+#     # 🎯 목표 도달 여부는 reward 대신 terminated 플래그(or 좌표 비교)로 판단
+#     if terminated:
+#         print(f"🎉 Goal reached in {step} steps!")
+#         break
+# else:
+#     print("❌ 최대 스텝 내에 goal 에 도달하지 못했습니다.")
