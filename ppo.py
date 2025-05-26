@@ -15,7 +15,7 @@ from env import (
 
 HEIGHT, WIDTH, WALL_P = 15, 15, 0.3
 MUT_RATE, PATCH = 0, 3
-MAX_STEPS = 200
+MAX_STEPS = 4000
 
 # ---------------------------------------------------------------------------
 def make_env(seed: int | None = None):
@@ -73,7 +73,7 @@ if __name__ == "__main__":
     eval_freq = 1_000
     eval_cb  = EvalCallback(
         eval_env, best_model_save_path="./best",
-        eval_freq=eval_freq*N_ENVS, n_eval_episodes=8,
+        eval_freq=eval_freq//N_ENVS, n_eval_episodes=8,
         deterministic=False, render=False,
     )
 

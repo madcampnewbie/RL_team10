@@ -13,7 +13,7 @@ from VecEnvRenderWrapper import VecEnvRenderWrapper
 def make_env(seed=None):
     env = RandomMapWrapper(15, 15, 0.3, 0, 3, render_mode='human')
     env = Monitor(env)
-    env = TimeLimit(env, max_episode_steps=200)
+    env = TimeLimit(env, max_episode_steps=4000)
     if seed is not None:
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
@@ -25,7 +25,7 @@ env = VecEnvRenderWrapper(env)
 
 # 모델 불러오기
 model = RecurrentPPO.load(
-    "best/best_model",
+    "grid_lstm_agent_last", #best/best_model
     env=env,
     custom_objects={"features_extractor_class": MemoryExtractor}
 )
@@ -46,18 +46,19 @@ while True:
     action, state = model.predict(obs, state=state, deterministic=False)
     obs, reward, done, info = env.step(action)
 
+    episode_rewards += reward[0]
+    step_num += 1
+    time.sleep(0.1)
+
     if done[0]:
         print(f"Step: {step_num}, Action: {action[0]}, Reward: {reward[0]:.3f}, Done: {done[0]}, Info: {info[0]}")
         print(f"\n✅ Episode total reward: {episode_rewards:.3f}")
         printed = 1
         break
-
+    
     print(f"Step: {step_num}, Action: {action[0]}, Reward: {reward[0]:.3f}, Done: {done[0]}, Info: {info[0]}")
+    
     env.render()
-
-    episode_rewards += reward[0]
-    step_num += 1
-    time.sleep(0.1)
 
 if printed==0:
     print(f"\n✅ Episode total reward: {episode_rewards:.3f}")

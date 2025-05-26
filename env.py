@@ -89,7 +89,7 @@ class GridEnv(gym.Env):
         self.render_mode = render_mode
 
         self.memory_map = np.full_like(grid, -1, dtype=np.int32)
-        self.act_map = np.full((grid.shape[0], grid.shape[1], 4), -1, dtype=np.int32)  # ← 초기값 -1로 변경
+        self.act_mem_step = np.full((grid.shape[0], grid.shape[1], 4), -1, dtype=np.int32)
         self.reachable_starts = reachable_starts
         self.height, self.width = grid.shape
 
@@ -98,7 +98,7 @@ class GridEnv(gym.Env):
             "local":    gym.spaces.Box(0, 2, (3, 3), dtype=np.int32),
             "original": gym.spaces.Box(0, 2, self.grid.shape, dtype=np.int32),
             "memory":   gym.spaces.Box(-1, 3, self.grid.shape, dtype=np.int32),
-            "act_mem":  gym.spaces.Box(-1, np.iinfo(np.int32).max, (self.height, self.width, 4), dtype=np.int32),
+            "act_mem_step": gym.spaces.Box(-1, np.iinfo(np.int32).max, (self.height, self.width, 4), dtype=np.int32),
         })
 
     def _update_memory(self):
@@ -113,7 +113,7 @@ class GridEnv(gym.Env):
         self.agent_pos = list(random.choice(self.reachable_starts))
         self.steps = 0
         self.memory_map.fill(-1)
-        self.act_map.fill(-1)  # 초기화 시 -1로 설정
+        self.act_mem_step.fill(-1)
         self._update_memory()
         return self._get_obs(), {}
 
@@ -129,7 +129,7 @@ class GridEnv(gym.Env):
             "local": local,
             "original": self.original,
             "memory": self.memory_map.copy(),
-            "act_mem": self.act_map.copy(),
+            "act_mem_step": self.act_mem_step.copy(),
         }
 
     def step(self, action):
@@ -143,12 +143,12 @@ class GridEnv(gym.Env):
             moved = True
 
         self._update_memory()
+        self.act_mem_step[y, x, action] = self.steps
         self.steps += 1
-        self.act_map[y, x, action] = self.steps  # 현재 스텝 시점 기록
 
         terminated = self.agent_pos == list(self.goal)
         step_penalty = -0.01
-        stay_penalty = -0.1 if not moved else 0.0
+        stay_penalty = -10 if not moved else 0.0
         reward = (10.0 if terminated else 0.0) + step_penalty + stay_penalty
 
         return self._get_obs(), reward, terminated, False, {}
@@ -167,31 +167,3 @@ class GridEnv(gym.Env):
     def close(self):
         pass
 
-# ------------------------------------------------------------
-# 사용 예시
-# ------------------------------------------------------------
-
-# # 1) 맵 준비 ---------------------------------------------------
-# height, width, wall_prob = 15, 15, 0.7
-# grid, goal, _ = generate_diverse_path(height, width, wall_prob)
-# original = grid.copy()
-# mutated  = mutate_walls_nearby(grid, 0.5, 3)
-
-# reachable = [(y,x) for y in range(height) for x in range(width)
-#              if mutated[y,x]==0 and is_path_exists(mutated,(y,x),goal)]
-# env = GridEnv(mutated, goal, reachable, original)
-
-# # 2) 랜덤 워크 --------------------------------------------------
-# obs, _ = env.reset()
-# max_step = 500          # 무한 루프 방지용 한도
-# for step in range(1, max_step+1):
-#     env.render()                     # 맵 출력
-#     action = env.action_space.sample()
-#     obs, _, terminated, truncated, _ = env.step(action)
-
-#     # 🎯 목표 도달 여부는 reward 대신 terminated 플래그(or 좌표 비교)로 판단
-#     if terminated:
-#         print(f"🎉 Goal reached in {step} steps!")
-#         break
-# else:
-#     print("❌ 최대 스텝 내에 goal 에 도달하지 못했습니다.")
