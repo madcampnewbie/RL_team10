@@ -2,27 +2,54 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from env import generate_diverse_path, mutate_walls_nearby,GridEnv
+from collections import deque
+import random
+
+from env import generate_diverse_path, mutate_walls_nearby, GridEnv
 from guidance_module import compute_policy_field, visualize_policy
 from localization_module import train_localization_module
-from collect_trajectories import collect_trajectory, get_dijkstra_direction
+from collect_trajectories import improved_collect_trajectory
 
-class PolicyNetV2(nn.Module):
-    def __init__(self, obs_dim=3*3, action_dim=4, hidden_dim=256):  # 128 -> 256
+
+# ===== Improved Policy Network =====
+class ImprovedPolicyNet(nn.Module):
+    def __init__(self, obs_dim=3*3, action_dim=4, hidden_dim=256):
         super().__init__()
-        input_dim = obs_dim + action_dim + 2 + 4
         
-        # 2층 GRU로 확장
-        self.gru = nn.GRU(input_dim, hidden_dim, num_layers=2, batch_first=True)
-        
-        # 더 깊은 헤드
-        self.actor_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim//2),
+        # Separate processing streams
+        self.obs_encoder = nn.Sequential(
+            nn.Linear(obs_dim, 64),
             nn.ReLU(),
+            nn.Linear(64, 64)
+        )
+        
+        self.guidance_encoder = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32)
+        )
+        
+        self.loc_encoder = nn.Sequential(
+            nn.Linear(2, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32)
+        )
+        
+        # Attention mechanism for guidance
+        self.guidance_attention = nn.Linear(hidden_dim, 1)
+        
+        # Combined processing
+        combined_dim = 64 + 32 + 32 + 4  # obs + guidance + loc + prev_action
+        self.gru = nn.GRU(combined_dim, hidden_dim, num_layers=2, batch_first=True, dropout=0.1)
+        
+        # Separate heads with guidance influence
+        self.actor_head = nn.Sequential(
+            nn.Linear(hidden_dim + 4, hidden_dim//2),  # +4 for guidance
+            nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim//2, action_dim)
         )
         
@@ -34,292 +61,322 @@ class PolicyNetV2(nn.Module):
 
     def forward(self, obs_seq, act_seq, loc_seq, guide_seq, hidden_state=None):
         B, T, H, W = obs_seq.shape
-        obs_flat = obs_seq.view(B, T, -1)
-        act_seq = act_seq.view(B, T, -1)
-        x = torch.cat([obs_flat, act_seq, loc_seq, guide_seq], dim=-1)
         
-        out, hidden = self.gru(x, hidden_state)
-        logits = self.actor_head(out)
-        values = self.critic_head(out).squeeze(-1)
-        return logits, values, hidden
-
-class PolicyNet(nn.Module):
-    def __init__(self, obs_dim=3*3, action_dim=4, hidden_dim=128):
-        super().__init__()
-        input_dim = obs_dim + action_dim + 2 + 4  # 
-        self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
-        self.actor_head = nn.Linear(hidden_dim, action_dim)
-        self.critic_head = nn.Linear(hidden_dim, 1)
-
-    def forward(self, obs_seq, act_seq, loc_seq, guide_seq, hidden_state=None):   # obs_seq는 (B,T,3,3) 형태, action_seq : (B,T,4), loc_seq는 (B,T,2)로 위치추정, guide_seq는 (B,T,4)
-        
-        B, T, H, W = obs_seq.shape
+        # Encode different inputs
         obs_flat = obs_seq.view(B, T, -1)
-        act_seq = act_seq.view(B,T, -1)                                           # 이걸 flatten
-        x = torch.cat([obs_flat, act_seq, loc_seq, guide_seq], dim=-1)              # 다시 condat
-        out, hidden = self.gru(x, hidden_state)
-        logits = self.actor_head(out)
-        values = self.critic_head(out).squeeze(-1)
-        return logits, values, hidden
+        obs_encoded = self.obs_encoder(obs_flat)
+        guide_encoded = self.guidance_encoder(guide_seq)
+        loc_encoded = self.loc_encoder(loc_seq)
+        
+        # Combine all features
+        x = torch.cat([obs_encoded, guide_encoded, loc_encoded, act_seq], dim=-1)
+        
+        # GRU processing
+        gru_out, hidden = self.gru(x, hidden_state)
+        
+        # Compute guidance attention weight
+        guidance_weight = torch.sigmoid(self.guidance_attention(gru_out))
+        
+        # Actor with guidance influence
+        actor_input = torch.cat([gru_out, guide_seq * guidance_weight], dim=-1)
+        logits = self.actor_head(actor_input)
+        
+        # Add guidance bias to logits (encourage following guidance)
+        guidance_bias = guide_seq * 2.0  # Amplify guidance signal
+        logits = logits + guidance_bias
+        
+        # Critic (no direct guidance influence)
+        values = self.critic_head(gru_out).squeeze(-1)
+        
+        return logits, values, hidden, guidance_weight
 
 
+
+
+
+# ===== GAE Computation =====
 def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
-    """
-    Args:
-        rewards: (B, T)
-        values: (B, T)
-        dones: (B, T)
-    Returns:
-        advantages, returns: (B, T)
-    """
+    """Generalized Advantage Estimation"""
     B, T = rewards.shape
-    advantages = torch.zeros((B, T), dtype=torch.float32).to(rewards.device)
-    returns = torch.zeros((B, T), dtype=torch.float32).to(rewards.device)
+    advantages = torch.zeros_like(rewards)
+    returns = torch.zeros_like(rewards)
     
     for b in range(B):
         last_gae = 0
         for t in reversed(range(T)):
             next_value = values[b, t + 1] if t + 1 < T else 0
             mask = 1.0 - dones[b, t].item()
-            delta = rewards[b, t].item() + gamma * next_value * mask - values[b, t].item()
+            delta = rewards[b, t] + gamma * next_value * mask - values[b, t]
             last_gae = delta + gamma * lam * mask * last_gae
             advantages[b, t] = last_gae
             returns[b, t] = advantages[b, t] + values[b, t]
     
     return advantages.detach(), returns.detach()
 
-def test_optimal_path(env, guidence):
-    print(f"Start: {env.agent_pos}, Goal: {env.goal}")
+
+
+
+
+
+
+
+# ===== Improved PPO Update =====
+def improved_ppo_update(policy_net, optimizer, trajectories, 
+                       clip_param=0.2, value_coef=0.5, entropy_coef=0.01,
+                       max_grad_norm=0.5, ppo_epochs=4):
+    """
+    Improved PPO update with multiple epochs and gradient clipping
+    """
+
+    # Concatenate all trajectories
+    obs = torch.cat([t["obs"] for t in trajectories], dim=1)
+    prev_actions = torch.cat([t["prev_actions"] for t in trajectories], dim=1)
+    loc = torch.cat([t["loc"] for t in trajectories], dim=1)
+    guide = torch.cat([t["guide"] for t in trajectories], dim=1)
+    actions = torch.cat([t["actions"] for t in trajectories], dim=1)
+    rewards = torch.cat([t["rewards"] for t in trajectories], dim=1).squeeze(-1)
+    dones = torch.cat([t["dones"] for t in trajectories], dim=1).squeeze(-1)
+    old_logps = torch.cat([t["logps"] for t in trajectories], dim=1)
     
-    for step in range(50):
-        optimal_action = guidence[env.agent_pos[0]][env.agent_pos[1]]
-        #optimal_action = get_dijkstra_direction(env.grid, env.goal, env.agent_pos)
-        print(f"Step {step}: Pos {env.agent_pos}, Action {optimal_action}")
+    # Compute advantages and returns once
+    with torch.no_grad():
+        _, old_values, _, _ = policy_net(obs, prev_actions, loc, guide)
+        advantages, returns = compute_gae(rewards, old_values, dones)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    
+    # Multiple epochs of PPO updates
+    for _ in range(ppo_epochs):
+        # Forward pass
+        logits, values, _, guidance_weights = policy_net(obs, prev_actions, loc, guide)
         
-        obs, reward, done, _ = env.step(optimal_action)
+        # Compute new log probs and entropy
+        dist = torch.distributions.Categorical(logits=logits)
+        new_logps = dist.log_prob(actions)
+        entropy = dist.entropy().mean()
         
-        if done:
-            print(f"Reached goal in {step+1} steps! Reward: {reward}")
-            return True
-            
-    print("Failed to reach goal with optimal policy!")
-    return False
-
-
-
-
-def ppo_update(policy_net, optimizer, batch, clip_param=0.2, value_coef=0.5, entropy_coef=0.01):
-    """
-    batch: dict containing:
-        - obs: (B, T, 3, 3)
-        - prev_actions: (B, T, 4)
-        - loc: (B, T, 2)
-        - guide: (B, T, 4)
-        - actions: (B, T)
-        - rewards: (B, T, 1)
-        - dones: (B, T, 1)
-        - logps: (B, T)
-    """
-    obs = batch["obs"]
-    prev_actions = batch["prev_actions"]
-    loc = batch["loc"]
-    guide = batch["guide"]
-    actions = batch["actions"]
-    rewards = batch["rewards"].squeeze(-1)  # (B, T, 1) -> (B, T)
-    dones = batch["dones"].squeeze(-1)      # (B, T, 1) -> (B, T)
-    old_logps = batch["logps"]
+        # PPO loss
+        ratio = (new_logps - old_logps).exp()
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * advantages
+        policy_loss = -torch.min(surr1, surr2).mean()
+        
+        # Value loss
+        value_loss = F.mse_loss(values, returns)
+        
+        # Guidance regularization - encourage using guidance when confident
+        guidance_reg = -guidance_weights.mean() * 0.1
+        
+        # Total loss
+        loss = policy_loss + value_coef * value_loss - entropy_coef * entropy + guidance_reg
+        
+        # Backward and clip gradients
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_grad_norm)
+        optimizer.step()
     
-    #print(f"obs: {obs.shape}, prev_actions: {prev_actions.shape}, loc: {loc.shape}, guide: {guide.shape}")
-    #print(f"actions: {actions.shape}, rewards: {rewards.shape}, dones: {dones.shape}, old_logps: {old_logps.shape}")
+    return {
+        'policy_loss': policy_loss.item(),
+        'value_loss': value_loss.item(),
+        'entropy': entropy.item(),
+        'guidance_weight': guidance_weights.mean().item()
+    }
+
+
+
+
+
+
+# ===== Curriculum Learning =====
+class CurriculumScheduler:
+    def __init__(self, start_mutation_rate=0.0, end_mutation_rate=0.2,                                                                                                                                                                                                                                                                                                  
+                 warmup_episodes=2000, total_episodes=20000):
+        self.start_rate = start_mutation_rate
+        self.end_rate = end_mutation_rate
+        self.warmup = warmup_episodes
+        self.total = total_episodes
+        
+    def get_mutation_rate(self, episode):
+        if episode < self.warmup:
+            return self.start_rate
+        
+        progress = (episode - self.warmup) / (self.total - self.warmup)
+        progress = min(1.0, progress)
+        return self.start_rate + (self.end_rate - self.start_rate) * progress
+
+
+
+
+
+
+
+# ===== Evaluation Functions =====
+def evaluate_on_hard_envs(policy_net, localization_module, base_grid, goal, 
+                         num_eval_episodes=20, device='cpu'):
+    """Evaluate on environments with high mutation rates"""
+    policy_net.eval()
+    successes = 0
     
-    B, T, _, _ = obs.shape
-
-    # 정책 네트워크 forward
-    logits, values, _ = policy_net(obs, prev_actions, loc, guide)  # logits: (B, T, 4), values: (B, T)
-
-    # ppo_update에서 loss 계산 전에 추가
-    #print(f"Action distribution: {torch.bincount(actions.flatten(), minlength=4)}")
-    #print(f"Logits range: {logits.min():.3f} ~ {logits.max():.3f}")
-    #print(f"Values range: {values.min():.3f} ~ {values.max():.3f}")
+    for i in range(num_eval_episodes):
+        # Create hard environment
+        mutated_grid, reachable = mutate_walls_nearby(
+            base_grid, goal, 
+            mutation_rate=0.3,  # High mutation
+            patch_size=5,       # Larger patches
+            seed=1000 + i
+        )
+        guidance = compute_policy_field(mutated_grid, goal)
+        env = GridEnv(mutated_grid, goal, reachable)
+        
+        # Run episode
+        with torch.no_grad():
+            trajectory = improved_collect_trajectory(
+                env, policy_net, localization_module, guidance,
+                device=device, max_steps=50
+            )
+        
+        if trajectory['success']:
+            successes += 1
     
-    # 확률 분포 및 로그 확률 계산
-    dist = torch.distributions.Categorical(logits=logits)
-    new_logps = dist.log_prob(actions)  # (B, T)
-    entropy = dist.entropy().mean()
-
-    # GAE 계산
-    advantages, returns = compute_gae(rewards, values, dones)  # (B, T), (B, T)
-
-    # PPO 손실 계산
-    ratio = (new_logps - old_logps).exp()
-    surr1 = ratio * advantages
-    surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * advantages
-    policy_loss = -torch.min(surr1, surr2).mean()
-    value_loss = F.mse_loss(values, returns)
-    loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
-
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-
-    return policy_loss.item(), value_loss.item(), entropy.item()
-
-def analyze_episode_quality(data):
-    total_reward = data["rewards"].sum().item()
-    episode_length = data["rewards"].shape[1]
-    
-    print(f"Episode reward: {total_reward:.3f}, Length: {episode_length}")
-    
-    # 액션별 보상 분석
-    actions = data["actions"].squeeze(0)  # (T,)
-    rewards = data["rewards"].squeeze(0).squeeze(-1)  # (T,)
-    
-    for action in range(4):
-        action_mask = (actions == action)
-        if action_mask.sum() > 0:
-            avg_reward = rewards[action_mask].mean()
-            print(f"Action {action}: count={action_mask.sum()}, avg_reward={avg_reward:.3f}")
+    policy_net.train()
+    return successes / num_eval_episodes
 
 
-def compute_losses(policy_net, batch, clip_param=0.2, value_coef=0.5, entropy_coef=0.01):
-    """
-    PPO 손실들을 계산하되 backward는 하지 않음
-    """
-    obs = batch["obs"]
-    prev_actions = batch["prev_actions"]
-    loc = batch["loc"]
-    guide = batch["guide"]
-    actions = batch["actions"]
-    rewards = batch["rewards"].squeeze(-1)  # (B, T, 1) -> (B, T)
-    dones = batch["dones"].squeeze(-1)      # (B, T, 1) -> (B, T)
-    old_logps = batch["logps"]
-    
-    B, T, _, _ = obs.shape
-
-    # 정책 네트워크 forward
-    logits, values, _ = policy_net(obs, prev_actions, loc, guide)
-    
-    # 확률 분포 및 로그 확률 계산
-    dist = torch.distributions.Categorical(logits=logits)
-    new_logps = dist.log_prob(actions)
-    entropy = dist.entropy().mean()
-
-    # GAE 계산
-    advantages, returns = compute_gae(rewards, values, dones)
-
-    # PPO 손실 계산
-    ratio = (new_logps - old_logps).exp()
-    surr1 = ratio * advantages
-    surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * advantages
-    policy_loss = -torch.min(surr1, surr2).mean()
-    value_loss = F.mse_loss(values, returns)
-
-    return policy_loss, value_loss, entropy
 
 
+
+
+
+
+
+
+# ===== Main Training Function =====
 def main():
-    # 지도가 주어짐
-    grid, goal, reachable_starts = generate_diverse_path(height=10, width=10, wall_prob=0.3, seed = 42)
-    guidence = compute_policy_field(grid, goal)
-
-    visualize_policy(guidence)
-
-    
+    # Setup
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", DEVICE)
-
+    print(f"Using device: {DEVICE}")
     
+    # Generate base map
+    grid, goal, reachable_starts = generate_diverse_path(
+        height=10, width=10, wall_prob=0.3, seed=42
+    )
+    guidance = compute_policy_field(grid, goal)
+    
+    print("Base map generated. Goal:", goal)
+    visualize_policy(guidance)
+    
+    # Train localization module
+    print("\nTraining localization module...")
     localization_module = train_localization_module(grid, goal, reachable_starts, visualize=False)
+    localization_module = localization_module.to(DEVICE)
     localization_module.eval()
     for param in localization_module.parameters():
         param.requires_grad = False
-
-    policy_net = PolicyNetV2().to(DEVICE)
+    
+    # Initialize policy network
+    policy_net = ImprovedPolicyNet().to(DEVICE)
     optimizer = optim.Adam(policy_net.parameters(), lr=3e-4)
     
-    # 배치 설정
-    batch_size = 10
-    collected_episodes = []
-    
-    # 이동 평균 추적
-    reward_history = []
-    moving_avg_window = 100
-
-
+    # Training configuration
     num_episodes = 10000
-    for episode in range(num_episodes):
-        if episode % 10 ==0:
-            mutated_grid, reachable_starts = mutate_walls_nearby(grid, goal, mutation_rate=0.2, patch_size=3)
-            env = GridEnv(mutated_grid, goal, reachable_starts)
+    batch_size = 16  # Collect more trajectories before update
+    update_frequency = batch_size
     
-        # trajectory 수집
-        data = collect_trajectory(env, policy_net, localization_module, guidence, DEVICE)
-        collected_episodes.append(data)
-        #analyze_episode_quality(data)
-        # PPO 업데이트
-        policy_loss, value_loss, entropy = ppo_update(policy_net, optimizer, data)
-
-        # 보상 기록
-        episode_reward = data["rewards"].sum().item()
-        reward_history.append(episode_reward)
-
-        if len(collected_episodes) >= batch_size:
-            # 그래디언트 초기화
-            optimizer.zero_grad()
-            
-            total_policy_loss = 0
-            total_value_loss = 0
-            total_entropy = 0
-            
-            # 각 에피소드별로 손실 계산 및 그래디언트 누적
-            for ep_data in collected_episodes:
-                policy_loss, value_loss, entropy = compute_losses(policy_net, ep_data)
-                
-                # 전체 손실 계산
-                loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
-                
-                # 그래디언트 누적 (배치 크기로 나누어서 평균화)
-                (loss / batch_size).backward()
-                
-                # 통계 누적
-                total_policy_loss += policy_loss.item()
-                total_value_loss += value_loss.item()
-                total_entropy += entropy.item()
-            
-            # 누적된 그래디언트로 한 번에 업데이트
-            optimizer.step()
-            
-            # 평균 손실 계산
-            avg_policy_loss = total_policy_loss / batch_size
-            avg_value_loss = total_value_loss / batch_size
-            avg_entropy = total_entropy / batch_size
-            
-            # 이동 평균 계산
-            if len(reward_history) >= moving_avg_window:
-                moving_avg = sum(reward_history[-moving_avg_window:]) / moving_avg_window
-            else:
-                moving_avg = sum(reward_history) / len(reward_history)
-            
-            # 로깅
-            recent_rewards = [ep["rewards"].sum().item() for ep in collected_episodes]
-            batch_avg_reward = sum(recent_rewards) / len(recent_rewards)
-            
-            if (episode + 1) % (batch_size * 5) == 0:  # 50 에피소드마다 출력
-                print(f"[{episode+1}/{num_episodes}] "
-                      f"Batch Avg Reward: {batch_avg_reward:.2f} | "
-                      f"Moving Avg ({moving_avg_window}): {moving_avg:.2f} | "
-                      f"π_loss: {avg_policy_loss:.3f} | "
-                      f"V_loss: {avg_value_loss:.3f} | "
-                      f"Entropy: {avg_entropy:.3f}")
-            
-            # 배치 초기화
-            collected_episodes = []
+    # Curriculum learning
+    curriculum = CurriculumScheduler(
+        start_mutation_rate=0.1,
+        end_mutation_rate=0.3,
+        warmup_episodes=1000,
+        total_episodes=num_episodes
+    )
+    
+    # Tracking
+    episode_rewards = []
+    success_rate_window = deque(maxlen=100)
+    best_success_rate = 0
+    
+    # Storage for trajectories
+    trajectory_buffer = []
+    
+    print("\nStarting training...")
+    
+    for episode in range(num_episodes):
+        # Curriculum-based environment mutation
+        mutation_rate = curriculum.get_mutation_rate(episode)
         
+        # Generate new environment variant every few episodes
+        if episode % 5 == 0:
+            mutated_grid, mutated_reachable = mutate_walls_nearby(
+                grid, goal, 
+                mutation_rate=mutation_rate, 
+                patch_size=3,
+                seed=episode  # Different seed for variety
+            )
+            guidance = compute_policy_field(mutated_grid, goal)
+            env = GridEnv(mutated_grid, goal, mutated_reachable)
+        
+        # Collect trajectory
+        trajectory = improved_collect_trajectory(
+            env, policy_net, localization_module, guidance, 
+            device=DEVICE, max_steps=50
+        )
+        
+        #print(trajectory["obs"].shape)
 
+        trajectory_buffer.append(trajectory)
+        episode_rewards.append(trajectory['total_reward'])
+        success_rate_window.append(1.0 if trajectory['success'] else 0.0)
+        
+        # Update policy
+        if len(trajectory_buffer) >= update_frequency:
+            # Perform PPO update
+            metrics = improved_ppo_update(
+                policy_net, optimizer, trajectory_buffer,
+                clip_param=0.2, value_coef=0.5, entropy_coef=0.01,
+                max_grad_norm=0.5, ppo_epochs=4
+            )
+            
+            # Clear buffer
+            trajectory_buffer = []
+            
+            # Logging
+            if (episode+1) % (update_frequency*10) == 0:
+                avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
+                success_rate = np.mean(list(success_rate_window))
+                
+                print(f"\n[Episode {episode}/{num_episodes}]")
+                print(f"  Mutation Rate: {mutation_rate:.3f}")
+                print(f"  Avg Reward (100 ep): {avg_reward:.2f}")
+                print(f"  Success Rate: {success_rate:.2%}")
+                print(f"  Policy Loss: {metrics['policy_loss']:.4f}")
+                print(f"  Value Loss: {metrics['value_loss']:.4f}")
+                print(f"  Entropy: {metrics['entropy']:.4f}")
+                print(f"  Guidance Weight: {metrics['guidance_weight']:.3f}")
+                
+                # Save best model
+                if success_rate > best_success_rate:
+                    best_success_rate = success_rate
+                    torch.save({
+                        'episode': episode,
+                        'model_state_dict': policy_net.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'success_rate': success_rate,
+                        'avg_reward': avg_reward
+                    }, 'best_navigation_model.pth')
+                    print(f"  💾 New best model saved! (Success rate: {success_rate:.2%})")
+        
+        # Periodic evaluation on harder environments
+        if episode % 500 == 0 and episode > 0:
+            print("\n🧪 Evaluating on hard environments...")
+            eval_success_rate = evaluate_on_hard_envs(
+                policy_net, localization_module, grid, goal, 
+                num_eval_episodes=20, device=DEVICE
+            )
+            print(f"  Hard environment success rate: {eval_success_rate:.2%}")
+    
+    print("\n✅ Training completed!")
+    print(f"Best success rate achieved: {best_success_rate:.2%}")
 
 
 if __name__ == "__main__":
-    num_episodes = 10000
-    value_coef = 0.5
-    entropy_coef = 0.01
     main()
