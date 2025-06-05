@@ -22,15 +22,17 @@ class MemoryExtractor(BaseFeaturesExtractor):
 
         # (3) memory + action_trace (총 6채널 CNN)
         self.mem_cnn = nn.Sequential(
-            nn.Conv2d(6, 16, 3, stride=1, padding=1), nn.ReLU(),
-            nn.Conv2d(16, 16, 3, stride=2), nn.ReLU(),
+            nn.Conv2d(9, 16, 3, stride=1, padding=1),  # 9채널로 변경
+            nn.ReLU(),
+            nn.Conv2d(16, 16, 3, stride=2),
+            nn.ReLU(),
             nn.Flatten()
         )
 
         with torch.no_grad():
             local_dim = self.local_cnn(torch.zeros(1, 1, 3, 3)).shape[1]
             orig_dim  = self.orig_cnn(torch.zeros(1, 1, H, W)).shape[1]
-            mem_dim   = self.mem_cnn(torch.zeros(1, 6, H, W)).shape[1]
+            mem_dim = self.mem_cnn(torch.zeros(1, 9, H, W)).shape[1]
         self._features_dim = local_dim + orig_dim + mem_dim
 
     def forward(self, obs):

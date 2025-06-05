@@ -11,7 +11,7 @@ from net import MemoryExtractor
 from VecEnvRenderWrapper import VecEnvRenderWrapper
 
 def make_env(seed=None):
-    env = RandomMapWrapper(15, 15, 0.3, 0, 3, render_mode='human')
+    env = RandomMapWrapper(7, 7, 0.3, 0, 3, render_mode='human')
     env = Monitor(env)
     env = TimeLimit(env, max_episode_steps=4000)
     if seed is not None:
@@ -43,7 +43,7 @@ env.render()
 
 printed = 0
 while True:
-    action, state = model.predict(obs, state=state, deterministic=False)
+    action, state = model.predict(obs, state=state, deterministic=True)
     obs, reward, done, info = env.step(action)
 
     episode_rewards += reward[0]
@@ -57,7 +57,7 @@ while True:
         break
     
     print(f"Step: {step_num}, Action: {action[0]}, Reward: {reward[0]:.3f}, Done: {done[0]}, Info: {info[0]}")
-    
+
     env.render()
 
 if printed==0:

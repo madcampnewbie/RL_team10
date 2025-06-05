@@ -137,10 +137,11 @@ class GridEnv(gym.Env):
         dy, dx = [(-1, 0), (1, 0), (0, -1), (0, 1)][action]
         ny, nx = y + dy, x + dx
 
-        moved = False
         if 0 <= ny < self.height and 0 <= nx < self.width and self.grid[ny, nx] != 1:
             self.agent_pos = [ny, nx]
             moved = True
+        else:
+            moved = False
 
         self._update_memory()
         self.act_mem_step[y, x, action] = self.steps
@@ -148,7 +149,7 @@ class GridEnv(gym.Env):
 
         terminated = self.agent_pos == list(self.goal)
         step_penalty = -0.01
-        stay_penalty = -10 if not moved else 0.0
+        stay_penalty = -0.5 if not moved else 0.0
         reward = (10.0 if terminated else 0.0) + step_penalty + stay_penalty
 
         return self._get_obs(), reward, terminated, False, {}

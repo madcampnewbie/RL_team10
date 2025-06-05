@@ -13,7 +13,7 @@ from env import (
     mutate_walls_nearby, is_path_exists
 )
 
-HEIGHT, WIDTH, WALL_P = 15, 15, 0.3
+HEIGHT, WIDTH, WALL_P = 7, 7, 0.3
 MUT_RATE, PATCH = 0, 3
 MAX_STEPS = 4000
 
